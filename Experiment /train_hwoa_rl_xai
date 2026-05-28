@@ -1,0 +1,296 @@
+"""
+Train HWOA-RL-XAI
+=================
+Main training entry point. Orchestrates:
+  1. LSTM-AE pre-training on workload traces
+  2. WOA outer loop for hyperparameter optimization
+  3. PPO inner loop with SHAP reward shaping
+  4. Evaluation checkpointing
+
+Usage:
+    python experiments/train_hwoa_rl_xai.py \
+        --config configs/cloudsim_200vm.yaml \
+        --seed 42 \
+        --output_dir results/cloudsim/200vm/run_seed42
+
+All hyperparameters are documented in configs/default.yaml and
+docs/HYPERPARAMETERS.md.
+"""
+
+import argparse
+import os
+import json
+import time
+import yaml
+import torch
+import numpy as np
+import random
+from pathlib import Path
+
+# Add project root to path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.models.lstm_autoencoder import LSTMAutoencoder
+from src.optimizers.woa_optimizer import WOAOptimizer, WOAConfig, decode_hyperparameters
+from src.explainability.shap_explainer import SHAPExplainer, SHAPConfig
+from src.utils.metrics import compute_all_kpis
+from src.utils.seeds import set_all_seeds
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train HWOA-RL-XAI scheduler")
+    parser.add_argument("--config", type=str, default="configs/cloudsim_200vm.yaml")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output_dir", type=str, default="results/run")
+    parser.add_argument("--device", type=str, default="auto",
+                        help="auto | cpu | cuda | cuda:0")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Resume from checkpoint path")
+    return parser.parse_args()
+
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    # Merge with defaults
+    default_path = Path(path).parent / "default.yaml"
+    if default_path.exists():
+        with open(default_path) as f:
+            defaults = yaml.safe_load(f)
+        defaults.update(cfg)
+        return defaults
+    return cfg
+
+
+def build_environment(cfg: dict, seed: int):
+    """Instantiate the CloudSim or Kubernetes Gym environment."""
+    env_type = cfg.get("environment", "cloudsim")
+    if env_type == "cloudsim":
+        from src.environments.cloudsim_env import CloudSimEnv
+        return CloudSimEnv(
+            n_vms=cfg["n_vms"],
+            n_tasks=cfg["n_tasks_per_epoch"],
+            seed=seed,
+            **cfg.get("env_kwargs", {}),
+        )
+    elif env_type == "kubernetes":
+        from src.environments.kubernetes_env import KubernetesEnv
+        return KubernetesEnv(**cfg.get("env_kwargs", {}))
+    else:
+        raise ValueError(f"Unknown environment: {env_type}")
+
+
+def pretrain_lstm_ae(cfg: dict, device: torch.device, output_dir: Path) -> LSTMAutoencoder:
+    """
+    Pre-train LSTM-AE on Google Cluster workload traces.
+    Configuration: Section 5.5 of the paper.
+      - 2-layer LSTM (128, 64 units)
+      - Adam, lr=1e-3, batch=64, max_epochs=200, patience=20
+      - Multi-task loss: λ1=0.5, λ2=0.3, λ3=0.2
+    """
+    from src.utils.data_loader import load_google_cluster_dataset
+    from torch.utils.data import DataLoader
+
+    print("[LSTM-AE] Loading workload dataset...")
+    train_dataset, val_dataset = load_google_cluster_dataset(
+        data_dir=cfg.get("data_dir", "data/processed/google_cluster"),
+        seq_len=cfg.get("lstm_seq_len", 30),
+        forecast_horizon=cfg.get("lstm_forecast_horizon", 5),
+    )
+
+    model = LSTMAutoencoder(
+        input_dim=cfg.get("lstm_input_dim", 5),
+        hidden_dims=tuple(cfg.get("lstm_hidden_dims", [128, 64])),
+        latent_dim=cfg.get("lstm_latent_dim", 64),
+        forecast_horizon=cfg.get("lstm_forecast_horizon", 5),
+        seq_len=cfg.get("lstm_seq_len", 30),
+        lambda1=cfg.get("lstm_lambda1", 0.5),
+        lambda2=cfg.get("lstm_lambda2", 0.3),
+        lambda3=cfg.get("lstm_lambda3", 0.2),
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.get("lstm_lr", 1e-3))
+    train_loader = DataLoader(train_dataset, batch_size=cfg.get("lstm_batch_size", 64), shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False)
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+    patience = cfg.get("lstm_patience", 20)
+    max_epochs = cfg.get("lstm_max_epochs", 200)
+
+    print(f"[LSTM-AE] Training for up to {max_epochs} epochs (patience={patience})...")
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        train_losses = []
+        for batch in train_loader:
+            x = batch["x"].to(device)
+            y = batch["y"].to(device)
+            a = batch["anomaly_label"].to(device)
+            optimizer.zero_grad()
+            loss = model.compute_loss(x, y, a)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        # Validation
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for batch in val_loader:
+                x = batch["x"].to(device)
+                y = batch["y"].to(device)
+                a = batch["anomaly_label"].to(device)
+                val_losses.append(model.compute_loss(x, y, a).item())
+        val_loss = np.mean(val_losses)
+
+        if epoch % 10 == 0:
+            print(f"  Epoch {epoch:3d}/{max_epochs} | train={np.mean(train_losses):.4f} | val={val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), output_dir / "lstm_ae_best.pt")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"[LSTM-AE] Early stopping at epoch {epoch}")
+                break
+
+    # Load best weights and fit anomaly threshold
+    model.load_state_dict(torch.load(output_dir / "lstm_ae_best.pt"))
+    threshold = model.fit_anomaly_threshold(val_loader)
+    print(f"[LSTM-AE] Anomaly threshold (99th pct): {threshold:.6f}")
+    return model
+
+
+def woa_fitness_fn(phi, env, ppo_agent_cls, shap_explainer, eval_steps: int, seed: int):
+    """
+    Fitness function for WOA: deploy PPO with hyperparameters Φ for `eval_steps`
+    and return composite cost J(Φ). Lower is better.
+    """
+    hp = decode_hyperparameters(phi)
+    agent = ppo_agent_cls(
+        env=env,
+        learning_rate=hp["learning_rate"],
+        gamma=hp["gamma"],
+        clip_range=hp["clip_range"],
+        shap_explainer=shap_explainer,
+        w_shap=hp["w5"],
+        seed=seed,
+    )
+    cost = agent.evaluate(n_steps=eval_steps, objective_weights={
+        "w1": hp["w1"], "w2": hp["w2"], "w3": hp["w3"], "w4": hp["w4"]
+    })
+    return cost
+
+
+def main():
+    args = parse_args()
+    cfg = load_config(args.config)
+
+    # Reproducibility
+    set_all_seeds(args.seed)
+
+    # Output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "logs").mkdir(exist_ok=True)
+
+    # Save config + seed for reproducibility
+    with open(output_dir / "config.yaml", "w") as f:
+        yaml.dump({**cfg, "seed": args.seed}, f)
+
+    # Device
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    print(f"[Main] Using device: {device}")
+
+    # Build environment
+    env = build_environment(cfg, args.seed)
+    print(f"[Main] Environment: {cfg.get('environment', 'cloudsim')} | VMs: {cfg.get('n_vms')}")
+
+    # ---- Phase 1: LSTM-AE pre-training ----
+    lstm_ae = pretrain_lstm_ae(cfg, device, output_dir)
+    lstm_ae.eval()
+
+    # ---- Phase 2: Initialize SHAP Explainer ----
+    # Background data: random state samples from env warm-up
+    print("[SHAP] Collecting background states...")
+    background_states = env.collect_background_states(n=cfg.get("shap_background_size", 100))
+    shap_cfg = SHAPConfig(top_k=cfg.get("shap_top_k", 3), w5=cfg.get("shap_w5", 0.05))
+
+    from src.agents.ppo_agent import PPOAgent
+    policy_fn = lambda states: PPOAgent.static_action_probs(states)  # placeholder
+    shap_explainer = SHAPExplainer(policy_fn, background_states, shap_cfg)
+
+    # ---- Phase 3: WOA outer loop ----
+    print(f"[WOA] Starting outer loop: N={cfg.get('woa_n_particles', 30)}, T={cfg.get('woa_max_iter', 100)}")
+    woa_cfg = WOAConfig(
+        n_particles=cfg.get("woa_n_particles", 30),
+        max_iter=cfg.get("woa_max_iter", 100),
+        levy_beta=cfg.get("woa_levy_beta", 1.5),
+        diversity_threshold=cfg.get("woa_diversity_threshold", 0.1),
+        eval_steps=cfg.get("woa_eval_steps", 50),
+        seed=args.seed,
+    )
+    woa = WOAOptimizer(woa_cfg)
+
+    fitness_fn = lambda phi: woa_fitness_fn(
+        phi, env, PPOAgent, shap_explainer,
+        eval_steps=woa_cfg.eval_steps, seed=args.seed
+    )
+    best_phi, best_cost = woa.optimize(fitness_fn)
+    best_hp = decode_hyperparameters(best_phi)
+    print(f"[WOA] Best hyperparameters: {best_hp}")
+    print(f"[WOA] Best cost J(Φ): {best_cost:.4f}")
+
+    # Save WOA convergence history
+    iters, fits = woa.get_convergence_history()
+    with open(output_dir / "woa_convergence.json", "w") as f:
+        json.dump({"iterations": iters, "fitness": fits}, f)
+
+    # ---- Phase 4: Full PPO training with best Φ ----
+    print("[PPO] Training full agent with optimized hyperparameters...")
+    agent = PPOAgent(
+        env=env,
+        learning_rate=best_hp["learning_rate"],
+        gamma=best_hp["gamma"],
+        clip_range=best_hp["clip_range"],
+        shap_explainer=shap_explainer,
+        w_shap=best_hp["w5"],
+        seed=args.seed,
+        device=device,
+    )
+
+    total_timesteps = cfg.get("total_timesteps", 500_000)
+    agent.learn(
+        total_timesteps=total_timesteps,
+        callback_log_dir=str(output_dir / "logs"),
+        checkpoint_dir=str(output_dir),
+    )
+
+    # ---- Phase 5: Final evaluation ----
+    print("[Eval] Running final evaluation...")
+    results = agent.evaluate_full(n_episodes=10, objective_weights={
+        "w1": best_hp["w1"], "w2": best_hp["w2"],
+        "w3": best_hp["w3"], "w4": best_hp["w4"],
+    })
+    print(f"[Eval] Results: {results}")
+
+    with open(output_dir / "final_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    # Save SHAP attribution summary
+    shap_summary = shap_explainer.get_attribution_summary()
+    with open(output_dir / "shap_summary.json", "w") as f:
+        json.dump(shap_summary, f, indent=2)
+
+    print(f"\n[Done] All outputs saved to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
