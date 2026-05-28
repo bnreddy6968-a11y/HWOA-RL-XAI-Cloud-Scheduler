@@ -1,0 +1,39 @@
+"""
+Reproducibility Seed Management
+================================
+Centralised utility to fix all random sources for reproducible experiments.
+All experiments in the paper use seeds 42–51 (10 independent runs).
+"""
+
+import random
+import numpy as np
+import torch
+
+
+def set_all_seeds(seed: int, deterministic_cudnn: bool = True) -> None:
+    """
+    Fix all random number sources for full reproducibility.
+
+    Sources fixed:
+      - Python built-in `random`
+      - NumPy
+      - PyTorch (CPU and CUDA)
+      - cuDNN deterministic mode (may reduce GPU performance by ~5%)
+
+    Args:
+        seed: integer seed value (paper uses 42–51)
+        deterministic_cudnn: if True, forces cuDNN to use deterministic algorithms
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU
+
+    if deterministic_cudnn:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+# Paper experiment seeds (Table 4: 10 independent runs)
+PAPER_SEEDS = list(range(42, 52))  # [42, 43, 44, ..., 51]
