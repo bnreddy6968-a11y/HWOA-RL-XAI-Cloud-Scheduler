@@ -1,0 +1,184 @@
+# Reproducibility Guide
+
+This document provides complete instructions for reproducing all experimental results reported in the paper. Every number in Tables 4–7 and Figures 4–8 can be reproduced using the steps below.
+
+---
+
+## Reproducibility Checklist
+
+| Claim | Reproducing Script | Expected Output |
+|-------|-------------------|-----------------|
+| Table 4 (3-scale CloudSim) | `experiments/evaluate.py` with `--all_baselines` | `results/cloudsim/*/evaluation.json` |
+| Table 5 (Kubernetes results) | `experiments/evaluate.py --config configs/kubernetes.yaml` | `results/kubernetes/evaluation.json` |
+| Table 6 (Ablation study) | `experiments/ablation_study.py` | `results/ablation/ablation_summary.json` |
+| Table 7 (Statistical tests) | `experiments/evaluate.py --statistics` | `results/*/statistics.json` |
+| Figure 4 (Scaling curves) | `src/utils/visualization.py --plot scaling` | `results/figures/fig4_scaling.pdf` |
+| Figure 5 (SHAP + ablation) | `src/utils/visualization.py --plot shap` | `results/figures/fig5_shap.pdf` |
+| Figure 6 (Sensitivity) | `experiments/sensitivity_analysis.py` | `results/figures/fig6_sensitivity.pdf` |
+| Figure 7 (Convergence) | `experiments/convergence_analysis.py` | `results/figures/fig7_convergence.pdf` |
+| Figure 8 (LSTM-AE) | `experiments/evaluate.py --lstm_eval` | `results/figures/fig8_lstm.pdf` |
+
+---
+
+## Random Seeds
+
+All experiments use seeds **42 through 51** (10 independent runs). This produces the mean ± std values reported in all tables.
+
+| Seed | Purpose |
+|------|---------|
+| 42 | Primary seed (used for ablation figures) |
+| 43–51 | Independent replication runs |
+
+Seeds are fixed for: NumPy, PyTorch, Python `random`, and the CloudSim environment. See `src/utils/seeds.py`:
+
+```python
+set_all_seeds(seed)   # fixes all four sources
+```
+
+---
+
+## Hardware Used
+
+All CloudSim results were obtained on:
+
+| Resource | Specification |
+|----------|--------------|
+| CPU | Intel Xeon E5-2680v4 (28 cores) |
+| GPU | NVIDIA A100 40 GB |
+| RAM | 128 GB DDR4 |
+| OS | Ubuntu 22.04 LTS |
+| Python | 3.10.12 |
+| PyTorch | 2.1.0+cu118 |
+| CUDA | 11.8 |
+
+The Kubernetes experiments used the 32-node cluster described in Section 5.3.
+
+---
+
+## Estimated Compute
+
+| Experiment | GPU-hours | Notes |
+|------------|-----------|-------|
+| LSTM-AE training | 0.5 h | Google Cluster, 200 epochs |
+| CloudSim 50 VM (10 seeds × 7 methods) | 2 h | |
+| CloudSim 200 VM | 6 h | |
+| CloudSim 500 VM | 18 h | |
+| Ablation study | 4 h | 200 VM scale |
+| Sensitivity sweep | 3 h | |
+| Convergence analysis | 2 h | |
+| **Total** | **~35 h** | On NVIDIA A100 |
+
+---
+
+## Full Reproduction Pipeline
+
+```bash
+# 1. Environment setup
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+
+# 2. Download datasets
+bash scripts/download_datasets.sh --all
+
+# 3. Preprocess
+python datasets/google_cluster/preprocess.py --raw_dir data/raw/google_cluster --out_dir data/processed/google_cluster
+
+# 4. Run all experiments (sequential, ~35 GPU-hours)
+bash scripts/run_all_experiments.sh
+
+# OR: Run individual experiments:
+# CloudSim 50 VM
+for seed in 42 43 44 45 46 47 48 49 50 51; do
+  python experiments/train_hwoa_rl_xai.py \
+    --config configs/cloudsim_50vm.yaml \
+    --seed $seed \
+    --output_dir results/cloudsim/50vm/seed_$seed
+done
+
+# CloudSim 200 VM
+for seed in 42 43 44 45 46 47 48 49 50 51; do
+  python experiments/train_hwoa_rl_xai.py \
+    --config configs/cloudsim_200vm.yaml \
+    --seed $seed \
+    --output_dir results/cloudsim/200vm/seed_$seed
+done
+
+# CloudSim 500 VM
+for seed in 42 43 44 45 46 47 48 49 50 51; do
+  python experiments/train_hwoa_rl_xai.py \
+    --config configs/cloudsim_500vm.yaml \
+    --seed $seed \
+    --output_dir results/cloudsim/500vm/seed_$seed
+done
+
+# 5. Evaluate against all baselines
+python experiments/evaluate.py \
+  --results_dir results/cloudsim/ \
+  --all_baselines \
+  --seeds 42,43,44,45,46,47,48,49,50,51 \
+  --output results/tables/
+
+# 6. Ablation study
+python experiments/ablation_study.py \
+  --base_config configs/cloudsim_200vm.yaml \
+  --output results/ablation/
+
+# 7. Hyperparameter sensitivity
+python experiments/sensitivity_analysis.py \
+  --config configs/cloudsim_200vm.yaml \
+  --output results/sensitivity/
+
+# 8. Convergence analysis
+python experiments/convergence_analysis.py \
+  --results_dir results/ \
+  --output results/figures/
+
+# 9. Generate all figures
+python src/utils/visualization.py \
+  --results_dir results/ \
+  --output_dir results/figures/ \
+  --format pdf,png
+```
+
+---
+
+## Verifying Key Numbers
+
+After running the full pipeline, verify these key numbers from Table 4:
+
+```bash
+python scripts/verify_results.py --results_dir results/ --expected expected_results.json
+```
+
+Expected values at 500 VM scale (mean over 10 seeds):
+
+```json
+{
+  "HWOA-RL-XAI": {
+    "makespan_s": {"mean": 169.7, "std": 3.4, "tol": 2.0},
+    "sla_violation_pct": {"mean": 6.1, "std": 0.6, "tol": 0.5},
+    "dmr_pct": {"mean": 5.4, "std": 0.5, "tol": 0.5},
+    "cpu_util_pct": {"mean": 89.7, "std": 1.2, "tol": 1.0},
+    "energy_kwh": {"mean": 75.2, "std": 1.8, "tol": 2.0}
+  }
+}
+```
+
+Small numerical differences (within tolerance) are expected due to hardware-specific floating-point behavior.
+
+---
+
+## Troubleshooting
+
+**CUDA out of memory during 500 VM training:**
+Reduce `ppo_n_steps` in `configs/cloudsim_500vm.yaml` from 2048 to 1024. Results may differ by < 0.5%.
+
+**Google Cluster download fails:**
+The `gsutil` CLI requires a Google Cloud account. The preprocessed Parquet files (post-normalization) are available as a direct download via Zenodo (see `scripts/download_datasets.sh --dataset google_cluster_preprocessed`).
+
+**CloudSim Java dependency missing:**
+```bash
+sudo apt-get install default-jdk-headless
+# Verify: java -version  (should show 11+)
+```
