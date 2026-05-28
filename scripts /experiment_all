@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# run_all_experiments.sh
+# Full reproduction pipeline for all paper results (~35 GPU-hours on A100)
+set -euo pipefail
+
+SEEDS="42 43 44 45 46 47 48 49 50 51"
+RESULTS_DIR="results"
+
+echo "======================================================"
+echo " HWOA-RL-XAI: Full Experiment Reproduction Pipeline"
+echo "======================================================"
+
+# ── Phase 1: Dataset preprocessing ───────────────────────
+echo "[1/7] Preprocessing datasets..."
+python datasets/google_cluster/preprocess.py \
+    --raw_dir data/raw/google_cluster \
+    --out_dir data/processed/google_cluster
+
+# ── Phase 2: CloudSim 50 VM ──────────────────────────────
+echo "[2/7] CloudSim 50-VM experiments..."
+for seed in $SEEDS; do
+  python experiments/train_hwoa_rl_xai.py \
+      --config configs/cloudsim_50vm.yaml \
+      --seed $seed \
+      --output_dir $RESULTS_DIR/cloudsim/50vm/seed_$seed
+done
+
+# ── Phase 3: CloudSim 200 VM ─────────────────────────────
+echo "[3/7] CloudSim 200-VM experiments..."
+for seed in $SEEDS; do
+  python experiments/train_hwoa_rl_xai.py \
+      --config configs/cloudsim_200vm.yaml \
+      --seed $seed \
+      --output_dir $RESULTS_DIR/cloudsim/200vm/seed_$seed
+done
+
+# ── Phase 4: CloudSim 500 VM ─────────────────────────────
+echo "[4/7] CloudSim 500-VM experiments..."
+for seed in $SEEDS; do
+  python experiments/train_hwoa_rl_xai.py \
+      --config configs/cloudsim_500vm.yaml \
+      --seed $seed \
+      --output_dir $RESULTS_DIR/cloudsim/500vm/seed_$seed
+done
+
+# ── Phase 5: Ablation study ──────────────────────────────
+echo "[5/7] Ablation study (200-VM scale)..."
+python experiments/ablation_study.py \
+    --base_config configs/cloudsim_200vm.yaml \
+    --seeds $(echo $SEEDS | tr ' ' ',') \
+    --output $RESULTS_DIR/ablation/
+
+# ── Phase 6: Hyperparameter sensitivity ──────────────────
+echo "[6/7] Hyperparameter sensitivity analysis..."
+python experiments/sensitivity_analysis.py \
+    --config configs/cloudsim_200vm.yaml \
+    --output $RESULTS_DIR/sensitivity/
+
+# ── Phase 7: Evaluate & generate tables/figures ──────────
+echo "[7/7] Evaluation, statistical tests, and figures..."
+python experiments/evaluate.py \
+    --results_dir $RESULTS_DIR/cloudsim/ \
+    --all_baselines \
+    --seeds $(echo $SEEDS | tr ' ' ',') \
+    --statistics \
+    --output $RESULTS_DIR/tables/
+
+python experiments/convergence_analysis.py \
+    --results_dir $RESULTS_DIR/ \
+    --output $RESULTS_DIR/figures/
+
+python src/utils/visualization.py \
+    --results_dir $RESULTS_DIR/ \
+    --output_dir $RESULTS_DIR/figures/ \
+    --format pdf,png
+
+echo ""
+echo "======================================================"
+echo " All experiments complete!"
+echo " Results saved to: $RESULTS_DIR/"
+echo " Key files:"
+echo "   $RESULTS_DIR/tables/   — Tables 4–7"
+echo "   $RESULTS_DIR/figures/  — Figures 4–8"
+echo "======================================================"
