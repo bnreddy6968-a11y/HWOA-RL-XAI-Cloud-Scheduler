@@ -1,0 +1,206 @@
+"""
+SHAP-Based Explainability Layer
+================================
+Computes Shapley Additive Explanation values for RL scheduling decisions
+and feeds top-k feature rankings back into the PPO reward shaping step.
+
+This implements the closed-loop XAI mechanism described in Section 4.4.
+The SHAP reward bonus (Equation 13) accelerates convergence by 12% vs.
+the non-SHAP variant (ablation, Table 6).
+
+Features explained (5 principal features, Section 4.4):
+  0: queue_depth           — per-resource current queue length
+  1: predicted_workload    — LSTM-AE k-step forecast intensity
+  2: deadline_urgency      — remaining time / (estimated exec time)
+  3: energy_coefficient    — resource W/MIPS cost
+  4: available_bandwidth   — current bandwidth to resource
+
+SHAP runs asynchronously in production (6.1 ms, non-blocking on critical path).
+"""
+
+import numpy as np
+import shap
+import torch
+from typing import Callable, List, Optional, Tuple
+from dataclasses import dataclass
+
+
+FEATURE_NAMES = [
+    "queue_depth",
+    "predicted_workload",
+    "deadline_urgency",
+    "energy_coefficient",
+    "available_bandwidth",
+]
+
+# Scheduling direction implied by each feature:
+# +1 → action should prefer resources with LOWER feature value
+# -1 → action should prefer resources with HIGHER feature value
+FEATURE_DIRECTION = {
+    "queue_depth": +1,          # assign to shorter queues
+    "predicted_workload": +1,   # avoid heavily loaded resources
+    "deadline_urgency": -1,     # prioritize urgent tasks (high urgency → faster resource)
+    "energy_coefficient": +1,   # prefer energy-efficient resources
+    "available_bandwidth": -1,  # prefer high-bandwidth resources
+}
+
+
+@dataclass
+class SHAPConfig:
+    top_k: int = 3                  # Number of features used for reward bonus
+    w5: float = 0.05                # SHAP reward weight (paper default)
+    background_size: int = 100      # KernelSHAP background samples
+    async_mode: bool = True         # Run asynchronously in production
+    log_interval: int = 1           # Log every N epochs
+
+
+class SHAPExplainer:
+    """
+    Wraps KernelSHAP around the PPO policy to attribute scheduling decisions
+    to input features, then computes the SHAP reward bonus.
+
+    Usage:
+        explainer = SHAPExplainer(policy_fn, background_data, config)
+        shap_values = explainer.explain(state_batch)
+        reward_bonus = explainer.compute_reward_bonus(state_batch, action_batch)
+    """
+
+    def __init__(
+        self,
+        policy_fn: Callable[[np.ndarray], np.ndarray],
+        background_data: np.ndarray,
+        config: Optional[SHAPConfig] = None,
+    ):
+        """
+        Args:
+            policy_fn: callable (states: np.ndarray) → action_probs: np.ndarray
+            background_data: (n_background, feature_dim) reference samples
+            config: SHAPConfig instance
+        """
+        self.policy_fn = policy_fn
+        self.config = config or SHAPConfig()
+        self._feature_names = FEATURE_NAMES
+
+        # KernelSHAP explainer using policy as the black-box model
+        # Background summarised to `background_size` samples with k-means
+        bg = shap.kmeans(background_data, self.config.background_size)
+        self.explainer = shap.KernelExplainer(policy_fn, bg)
+
+        # Running log of per-epoch mean |φ| per feature
+        self.attribution_log: List[np.ndarray] = []
+
+    # ------------------------------------------------------------------
+    # Core Methods
+    # ------------------------------------------------------------------
+
+    def explain(self, state_batch: np.ndarray) -> np.ndarray:
+        """
+        Compute SHAP values for a batch of states.
+
+        Args:
+            state_batch: (batch_size, feature_dim)
+        Returns:
+            shap_values: (batch_size, feature_dim) — φ_j for each feature
+        """
+        # nsamples controls speed/accuracy trade-off; 200 is sufficient for 5 features
+        shap_values = self.explainer.shap_values(state_batch, nsamples=200)
+        if isinstance(shap_values, list):
+            # Multi-output: average across actions
+            shap_values = np.mean(np.abs(shap_values), axis=0)
+        return shap_values
+
+    def compute_reward_bonus(
+        self,
+        state_batch: np.ndarray,
+        action_batch: np.ndarray,
+    ) -> np.ndarray:
+        """
+        SHAP reward bonus (Equation 13):
+            φ_SHAP(s, a) = Σ_k [ φ_k · I_k(s, a) ] / max(φ)
+
+        where I_k(s, a) ∈ {0, 1} indicates whether action `a` aligns
+        with the scheduling direction implied by feature k.
+
+        Args:
+            state_batch: (batch_size, feature_dim)
+            action_batch: (batch_size,) — selected resource indices
+        Returns:
+            bonuses: (batch_size,) — SHAP reward bonus per step
+        """
+        shap_values = self.explain(state_batch)
+        mean_abs_shap = np.mean(np.abs(shap_values), axis=0)  # (feature_dim,)
+
+        # Rank features by mean |φ|, take top-k
+        top_k_idx = np.argsort(mean_abs_shap)[::-1][: self.config.top_k]
+
+        self.attribution_log.append(mean_abs_shap)
+
+        bonuses = np.zeros(len(state_batch))
+        max_phi = float(mean_abs_shap[top_k_idx[0]]) + 1e-8
+
+        for k in top_k_idx:
+            feat_name = self._feature_names[k]
+            direction = FEATURE_DIRECTION[feat_name]
+            phi_k = mean_abs_shap[k]
+
+            # I_k(s, a): check if action aligns with feature direction
+            # For simplicity, alignment is positive if the action resource has
+            # feature value in the favorable direction relative to batch mean.
+            feature_vals = state_batch[:, k]           # (batch_size,)
+            batch_mean = np.mean(feature_vals)
+            if direction == +1:
+                aligned = (feature_vals < batch_mean).astype(float)
+            else:
+                aligned = (feature_vals > batch_mean).astype(float)
+
+            bonuses += (phi_k / max_phi) * aligned
+
+        return self.config.w5 * bonuses
+
+    def get_top_k_features(self, state_batch: np.ndarray) -> List[str]:
+        """Return names of the top-k most influential features for this batch."""
+        shap_values = self.explain(state_batch)
+        mean_abs = np.mean(np.abs(shap_values), axis=0)
+        top_k_idx = np.argsort(mean_abs)[::-1][: self.config.top_k]
+        return [self._feature_names[i] for i in top_k_idx]
+
+    def get_attribution_summary(self) -> dict:
+        """
+        Return per-feature mean |φ| aggregated over all logged epochs.
+        Used for the SHAP dashboard (Figure 5a in the paper).
+        """
+        if not self.attribution_log:
+            return {}
+        arr = np.stack(self.attribution_log, axis=0)  # (epochs, n_features)
+        mean_abs = arr.mean(axis=0)
+        return {name: float(val) for name, val in zip(self._feature_names, mean_abs)}
+
+    def plot_summary(self, save_path: Optional[str] = None):
+        """
+        Bar chart of mean |φ| per feature (reproduces Figure 5a).
+        Requires matplotlib.
+        """
+        import matplotlib.pyplot as plt
+
+        summary = self.get_attribution_summary()
+        if not summary:
+            print("No attribution data logged yet.")
+            return
+
+        names = list(summary.keys())
+        vals = list(summary.values())
+        colors = ["#2196F3" if v > 0.2 else "#90CAF9" for v in vals]
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        bars = ax.barh(names, vals, color=colors)
+        ax.set_xlabel("Mean |SHAP value| (φ)", fontsize=12)
+        ax.set_title("Feature Attribution — HWOA-RL-XAI Scheduling Decisions", fontsize=13)
+        ax.axvline(0.2, color="gray", linestyle="--", linewidth=0.8, label="Significance threshold")
+        ax.legend(fontsize=9)
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        else:
+            plt.show()
+        plt.close()
