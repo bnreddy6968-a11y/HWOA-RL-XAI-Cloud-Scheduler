@@ -1,0 +1,107 @@
+# HWOA-RL-XAI Default Hyperparameter Configuration
+# All values correspond exactly to those reported in Section 5.5 of the paper.
+# Scale-specific overrides are in cloudsim_50vm.yaml, cloudsim_200vm.yaml, cloudsim_500vm.yaml
+
+# ─────────────────────────────────────────────────────────────
+# Environment
+# ─────────────────────────────────────────────────────────────
+environment: cloudsim           # cloudsim | kubernetes
+n_vms: 200                      # number of virtual machines
+n_tasks_per_epoch: 1000         # tasks submitted per simulation epoch
+epoch_duration: 1.0             # seconds per scheduling epoch
+
+# Infrastructure tier ratio (edge:regional:hyperscale = 3:2:5)
+tier_ratio: [3, 2, 5]
+
+# Task arrival process
+arrival_lambda: 20              # Poisson rate (tasks/time-unit); 5/20/50 for 50/200/500 VMs
+simulation_steps: 1000          # time units per simulation run
+
+# ─────────────────────────────────────────────────────────────
+# LSTM-Autoencoder  (Section 5.5, Section 4.2)
+# ─────────────────────────────────────────────────────────────
+lstm_input_dim: 5               # [cpu, memory, task_rate, net_io, task_type]
+lstm_hidden_dims: [128, 64]     # two stacked LSTM layers
+lstm_latent_dim: 64             # z ∈ R^64
+lstm_seq_len: 30                # sliding window length
+lstm_stride: 10                 # window stride
+lstm_forecast_horizon: 5        # k-step ahead prediction
+
+# Multi-task loss weights (Equation 8)
+lstm_lambda1: 0.5               # forecast MSE weight
+lstm_lambda2: 0.3               # reconstruction MSE weight
+lstm_lambda3: 0.2               # anomaly BCE weight
+
+# Training
+lstm_lr: 0.001
+lstm_batch_size: 64
+lstm_max_epochs: 200
+lstm_patience: 20               # early stopping patience
+lstm_anomaly_percentile: 99.0   # threshold for anomaly classification
+
+# Dataset
+data_dir: data/processed/google_cluster
+
+# ─────────────────────────────────────────────────────────────
+# Whale Optimization Algorithm  (Section 4.3.2)
+# ─────────────────────────────────────────────────────────────
+woa_n_particles: 30             # swarm population size N
+woa_max_iter: 100               # maximum WOA iterations T
+woa_levy_beta: 1.5              # Lévy stability index β
+woa_levy_alpha0: 0.01           # initial Lévy step scale
+woa_diversity_threshold: 0.1    # δ_div for triggering Lévy flight
+woa_eval_steps: 50              # K scheduling steps per fitness evaluation
+
+# Hyperparameter search bounds: [η, γ, w1, w2, w3, w4, w5, ε_clip]
+woa_lb: [0.0001, 0.90, 0.20, 0.15, 0.10, 0.05, 0.01, 0.10]
+woa_ub: [0.0100, 0.99, 0.50, 0.45, 0.40, 0.20, 0.10, 0.30]
+
+# ─────────────────────────────────────────────────────────────
+# PPO Agent  (Section 4.3.1, 5.5)
+# ─────────────────────────────────────────────────────────────
+# NOTE: The following are starting values; WOA tunes them per experiment.
+ppo_learning_rate: 0.0003
+ppo_gamma: 0.98                 # discount factor
+ppo_clip_range: 0.2             # ε_clip
+ppo_n_steps: 2048               # rollout buffer size
+ppo_batch_size: 64
+ppo_n_epochs: 10
+ppo_ent_coef: 0.0
+ppo_vf_coef: 0.5
+ppo_max_grad_norm: 0.5
+ppo_hidden_units: 256           # two hidden layers, ReLU activation
+ppo_n_hidden_layers: 2
+
+# Total training timesteps
+total_timesteps: 500000
+
+# ─────────────────────────────────────────────────────────────
+# Objective Weights  (Equation 3, selected by grid search)
+# ─────────────────────────────────────────────────────────────
+w1: 0.35    # makespan
+w2: 0.30    # deadline miss ratio (DMR)
+w3: 0.25    # energy consumption
+w4: 0.10    # CPU utilization (negative contribution, we maximize)
+
+# ─────────────────────────────────────────────────────────────
+# SHAP Explainability  (Section 4.4)
+# ─────────────────────────────────────────────────────────────
+shap_top_k: 3                   # top-k features used for reward bonus
+shap_w5: 0.05                   # w5 reward weight (Equation 9)
+shap_background_size: 100       # KernelSHAP background samples (k-means)
+shap_async_mode: true           # run asynchronously in production
+shap_log_interval: 1            # log attributions every N epochs
+shap_dashboard_interval: 60     # Grafana refresh interval (seconds)
+
+# ─────────────────────────────────────────────────────────────
+# Evaluation  (Section 5.6)
+# ─────────────────────────────────────────────────────────────
+n_eval_episodes: 10
+eval_seeds: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
+statistical_alpha: 0.05         # significance level for ANOVA
+
+# ─────────────────────────────────────────────────────────────
+# Reproducibility
+# ─────────────────────────────────────────────────────────────
+seed: 42                        # overridden by --seed CLI argument
+deterministic_cudnn: true
