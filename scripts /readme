@@ -1,0 +1,194 @@
+# Kubernetes Deployment Guide
+
+This document describes how to deploy HWOA-RL-XAI as a Kubernetes scheduler extender on a real cluster, reproducing the experiments in Section 5.3 and Section 6.2 of the paper.
+
+---
+
+## Architecture
+
+```
+kube-scheduler
+     │  Pod scheduling request
+     ▼
+HWOA-RL-XAI Extender API (Flask, GPU affinity)
+     │  queries LSTM-AE predictions + PPO policy
+     ▼
+Scored node rankings (within 100 ms timeout)
+     │
+     ▼
+Redis Message Bus ◄─── LSTM-AE Sidecar (Prometheus metrics → forecasts + anomaly alerts)
+                              │
+                    SHAP Worker Pod (async, publishes every 60s)
+                              │
+                    Grafana Dashboard (operator monitoring)
+```
+
+---
+
+## Cluster Requirements
+
+The paper's real-cluster experiments used:
+
+| Node Type | Count | Spec | Tier |
+|-----------|-------|------|------|
+| Edge nodes | 8 | 4 cores, 8 GB RAM, Intel Atom C3758 | Edge |
+| Regional nodes | 14 | 16 cores, 64 GB RAM, Intel Xeon E5-2680v4 | Regional |
+| Hyperscale nodes | 10 | 32 cores, 256 GB RAM, AMD EPYC 7543 | Hyperscale |
+
+Minimum requirement for local testing: 3-node cluster, 1 GPU node.
+
+Kubernetes version: **v1.28+**
+
+---
+
+## Pre-deployment
+
+### 1. Build Container Images
+
+```bash
+# Scheduler extender API
+docker build -t hwoa-rl-xai-extender:latest k8s/scheduler-extender/
+docker push <your-registry>/hwoa-rl-xai-extender:latest
+
+# LSTM-AE sidecar
+docker build -t hwoa-rl-xai-lstm:latest k8s/lstm-sidecar/
+docker push <your-registry>/hwoa-rl-xai-lstm:latest
+
+# SHAP worker
+docker build -t hwoa-rl-xai-shap:latest k8s/shap-worker/
+docker push <your-registry>/hwoa-rl-xai-shap:latest
+```
+
+Update image references in `k8s/manifests/*.yaml`.
+
+### 2. Upload Pre-trained Models
+
+```bash
+# Create ConfigMap with model paths or use a PersistentVolumeClaim
+kubectl create configmap hwoa-models \
+  --from-file=lstm_ae=pretrained/lstm_ae_google.pt \
+  --from-file=ppo_500vm=pretrained/hwoa_rl_xai_500vm.pt
+```
+
+---
+
+## Deployment
+
+```bash
+# 1. Create namespace
+kubectl create namespace hwoa-rl-xai
+
+# 2. Deploy Redis message bus
+kubectl apply -f k8s/manifests/redis.yaml -n hwoa-rl-xai
+
+# 3. Deploy LSTM-AE sidecar (connects to Prometheus)
+kubectl apply -f k8s/manifests/lstm-ae-sidecar.yaml -n hwoa-rl-xai
+
+# 4. Deploy SHAP worker
+kubectl apply -f k8s/manifests/shap-worker.yaml -n hwoa-rl-xai
+
+# 5. Deploy the scheduler extender API
+kubectl apply -f k8s/manifests/scheduler-extender-deployment.yaml -n hwoa-rl-xai
+
+# 6. Register the extender with kube-scheduler
+kubectl apply -f k8s/manifests/scheduler-policy.yaml -n kube-system
+
+# 7. Verify
+kubectl get pods -n hwoa-rl-xai
+kubectl get pods -n kube-system | grep kube-scheduler
+```
+
+### Resource Requests (per component)
+
+| Component | CPU Request | CPU Limit | Memory Request | Memory Limit |
+|-----------|------------|-----------|----------------|--------------|
+| Extender API | 200m | 1000m | 512Mi | 2Gi |
+| LSTM-AE Sidecar | 500m | 2000m | 1Gi | 4Gi |
+| SHAP Worker | 200m | 500m | 512Mi | 1Gi |
+| Redis | 100m | 200m | 256Mi | 512Mi |
+| **Total** | **~1 core** | **~3.7 cores** | **~2.3 GB** | **~7.5 GB** |
+
+---
+
+## Extender API
+
+The Flask API (`k8s/scheduler-extender/app.py`) exposes:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/filter` | POST | Filter infeasible nodes (tier-affinity constraint, Equation 6) |
+| `/prioritize` | POST | Score nodes using PPO policy + LSTM-AE predictions |
+| `/health` | GET | Health check for liveness/readiness probes |
+| `/metrics` | GET | Prometheus metrics (scheduling latency, decision counts) |
+
+The extender returns scored node rankings within the **100 ms** Kubernetes scheduling timeout. Measured critical-path latency: **~17.5 ms** per scheduling decision (Table 3 in the paper).
+
+---
+
+## Monitoring
+
+Prometheus metrics are scraped automatically. Import the Grafana dashboard:
+
+```bash
+kubectl apply -f k8s/manifests/grafana-dashboard-configmap.yaml
+```
+
+The dashboard shows:
+- Scheduling latency (p50, p95, p99)
+- SHAP feature attributions (updated every 60 s)
+- LSTM-AE forecasts vs. actual workload
+- Anomaly alerts
+- Per-node CPU utilization and energy consumption
+
+---
+
+## Running the RUBiS Workload
+
+```bash
+# Deploy RUBiS with 500 concurrent users
+kubectl apply -f datasets/rubis/k8s/
+kubectl wait --for=condition=ready pod -l app=rubis --timeout=300s
+
+# Run 2-hour experiment
+python datasets/rubis/load_generator.py \
+  --target $(kubectl get svc rubis-frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
+  --users 500 \
+  --duration 7200 \
+  --output results/kubernetes/rubis_traces.csv
+
+# Collect results
+python experiments/evaluate.py \
+  --config configs/kubernetes.yaml \
+  --output results/kubernetes/evaluation.json
+```
+
+---
+
+## Energy Measurement
+
+Energy consumption in the Kubernetes experiments was measured using **IPMI power sensors** at 1-second granularity:
+
+```bash
+# Install ipmitool on each node
+apt-get install ipmitool
+
+# Collect power readings (run on each node)
+python scripts/collect_power.py \
+  --interval 1 \
+  --duration 7200 \
+  --output results/kubernetes/power_node_<hostname>.csv
+
+# Aggregate
+python scripts/aggregate_energy.py \
+  --power_dir results/kubernetes/ \
+  --output results/kubernetes/energy_summary.json
+```
+
+---
+
+## Cleanup
+
+```bash
+kubectl delete namespace hwoa-rl-xai
+kubectl delete -f k8s/manifests/scheduler-policy.yaml -n kube-system
+```
