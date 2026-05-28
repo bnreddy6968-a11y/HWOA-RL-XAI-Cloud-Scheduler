@@ -1,0 +1,201 @@
+"""
+Whale Optimization Algorithm with Adaptive Lévy Flight
+======================================================
+WOA serves as the meta-controller that tunes PPO hyperparameters
+and explores the task-resource solution space globally.
+
+Each particle encodes:
+    Φ = [η, γ, w1, w2, w3, w4, w5, ε_clip]
+
+Adaptive Lévy flight is triggered when swarm diversity falls below
+threshold δ_div to prevent premature convergence.
+
+Convergence rate: O(t^{-0.5}) — see Theorem 1 in the paper (Section 4.3.2).
+"""
+
+import numpy as np
+from typing import Callable, Optional, Tuple
+from dataclasses import dataclass, field
+from scipy.stats import levy_stable
+
+
+@dataclass
+class WOAConfig:
+    # Swarm
+    n_particles: int = 30
+    max_iter: int = 100
+
+    # Hyperparameter search bounds: [η, γ, w1, w2, w3, w4, w5, ε_clip]
+    lb: np.ndarray = field(
+        default_factory=lambda: np.array([1e-4, 0.90, 0.20, 0.15, 0.10, 0.05, 0.01, 0.10])
+    )
+    ub: np.ndarray = field(
+        default_factory=lambda: np.array([1e-2, 0.99, 0.50, 0.45, 0.40, 0.20, 0.10, 0.30])
+    )
+
+    # Lévy flight
+    levy_beta: float = 1.5          # Stability index (paper uses β=1.5)
+    levy_alpha0: float = 0.01       # Initial step size scale
+    diversity_threshold: float = 0.1  # δ_div
+
+    # Fitness evaluation
+    eval_steps: int = 50            # K scheduling steps per fitness evaluation
+
+    # Seed
+    seed: Optional[int] = None
+
+
+class WOAOptimizer:
+    """
+    Whale Optimization Algorithm with adaptive Lévy flight diversity maintenance.
+
+    Position update rules (Equations 10-11):
+        Standard: X(t+1) = X*(t) - A·D,  D = C·|X*(t) - X(t)|
+        Lévy:     X(t+1) = X(t) + α·L(β)   if diversity < δ_div
+
+    where A = 2a·r1 - a, a linearly decreases 2→0,
+          C = 2·r2, and L(β) is Lévy-stable with β=1.5.
+    """
+
+    def __init__(self, config: WOAConfig):
+        self.cfg = config
+        self.dim = len(config.lb)
+        self.rng = np.random.default_rng(config.seed)
+
+        # Population: (n_particles, dim)
+        self.positions = self._init_population()
+        self.fitness = np.full(config.n_particles, np.inf)
+
+        self.best_position: Optional[np.ndarray] = None
+        self.best_fitness: float = np.inf
+        self.history: list = []  # (iter, best_fitness) for convergence plots
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def optimize(self, fitness_fn: Callable[[np.ndarray], float]) -> Tuple[np.ndarray, float]:
+        """
+        Run WOA optimization loop.
+
+        Args:
+            fitness_fn: callable taking Φ (dim-vector) and returning scalar cost J(Φ).
+                        Lower is better (minimization).
+        Returns:
+            best_position, best_fitness
+        """
+        # Initial fitness evaluation
+        for i in range(self.cfg.n_particles):
+            self.fitness[i] = fitness_fn(self.positions[i])
+
+        best_idx = np.argmin(self.fitness)
+        self.best_position = self.positions[best_idx].copy()
+        self.best_fitness = self.fitness[best_idx]
+        self.history.append((0, self.best_fitness))
+
+        for t in range(1, self.cfg.max_iter + 1):
+            a = 2.0 - 2.0 * t / self.cfg.max_iter  # linearly decreases 2→0
+
+            diversity = self._compute_diversity()
+            levy_triggered = diversity < self.cfg.diversity_threshold
+
+            for i in range(self.cfg.n_particles):
+                if levy_triggered:
+                    # Adaptive Lévy flight (Equation 11)
+                    alpha_t = self.cfg.levy_alpha0 * (t ** -0.5)
+                    step = alpha_t * self._levy_step()
+                    new_pos = self.positions[i] + step * (self.cfg.ub - self.cfg.lb)
+                else:
+                    p = self.rng.uniform()
+                    if p < 0.5:
+                        # Shrinking encircling (Equation 10)
+                        new_pos = self._encircle(self.positions[i], a)
+                    else:
+                        # Spiral bubble-net attack
+                        new_pos = self._spiral(self.positions[i])
+
+                # Clip to bounds
+                new_pos = np.clip(new_pos, self.cfg.lb, self.cfg.ub)
+                new_fitness = fitness_fn(new_pos)
+
+                self.positions[i] = new_pos
+                self.fitness[i] = new_fitness
+
+                if new_fitness < self.best_fitness:
+                    self.best_fitness = new_fitness
+                    self.best_position = new_pos.copy()
+
+            self.history.append((t, self.best_fitness))
+
+        return self.best_position, self.best_fitness
+
+    def get_convergence_history(self) -> Tuple[list, list]:
+        """Return (iterations, fitness_values) for plotting."""
+        iters, fits = zip(*self.history)
+        return list(iters), list(fits)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _init_population(self) -> np.ndarray:
+        """Latin Hypercube-like initialization within [lb, ub]."""
+        pop = self.rng.uniform(0, 1, (self.cfg.n_particles, self.dim))
+        return self.cfg.lb + pop * (self.cfg.ub - self.cfg.lb)
+
+    def _compute_diversity(self) -> float:
+        """Mean pairwise Euclidean distance, normalized by search range."""
+        range_norm = np.linalg.norm(self.cfg.ub - self.cfg.lb)
+        diffs = self.positions[:, None, :] - self.positions[None, :, :]  # (N, N, D)
+        dists = np.linalg.norm(diffs, axis=-1)  # (N, N)
+        return float(np.mean(dists)) / (range_norm + 1e-8)
+
+    def _levy_step(self) -> np.ndarray:
+        """
+        Lévy-stable random step with stability index β=1.5.
+        Uses Mantegna's algorithm for numerical stability.
+        """
+        beta = self.cfg.levy_beta
+        sigma_u = (
+            np.math.gamma(1 + beta)
+            * np.sin(np.pi * beta / 2)
+            / (np.math.gamma((1 + beta) / 2) * beta * 2 ** ((beta - 1) / 2))
+        ) ** (1 / beta)
+        u = self.rng.normal(0, sigma_u, self.dim)
+        v = self.rng.normal(0, 1, self.dim)
+        step = u / (np.abs(v) ** (1 / beta))
+        return step
+
+    def _encircle(self, x: np.ndarray, a: float) -> np.ndarray:
+        """Shrinking encircling mechanism (Equation 10)."""
+        r1 = self.rng.uniform(0, 1, self.dim)
+        r2 = self.rng.uniform(0, 1, self.dim)
+        A = 2 * a * r1 - a
+        C = 2 * r2
+        D = np.abs(C * self.best_position - x)
+        return self.best_position - A * D
+
+    def _spiral(self, x: np.ndarray) -> np.ndarray:
+        """Spiral bubble-net position update."""
+        b = 1.0  # spiral shape constant
+        l = self.rng.uniform(-1, 1, self.dim)
+        D_prime = np.abs(self.best_position - x)
+        return D_prime * np.exp(b * l) * np.cos(2 * np.pi * l) + self.best_position
+
+
+def decode_hyperparameters(phi: np.ndarray) -> dict:
+    """
+    Decode WOA particle into named PPO hyperparameters.
+
+    Φ = [η, γ, w1, w2, w3, w4, w5, ε_clip]
+    """
+    return {
+        "learning_rate": float(phi[0]),
+        "gamma": float(phi[1]),
+        "w1": float(phi[2]),   # makespan weight
+        "w2": float(phi[3]),   # DMR weight
+        "w3": float(phi[4]),   # energy weight
+        "w4": float(phi[5]),   # CPU utilization weight
+        "w5": float(phi[6]),   # SHAP reward weight
+        "clip_range": float(phi[7]),
+    }
